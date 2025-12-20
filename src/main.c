@@ -1,118 +1,202 @@
+#include <getopt.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 #include <string.h>
-#include "format.h"
-#include "fuzz.h"
-#include "inputgen.h"
-#include "crash.h"
 
-// Global variable for target binary path
-char* target_binary_path = NULL;
+#include "arm64dis.h"
+#include "exploit.h"
+#include "fuzzer.h"
+#include "macho.h"
+
+static Fuzzer *g_fuzzer = NULL;
+
+static void signal_handler(int sig) {
+  (void)sig;
+  if (g_fuzzer) {
+    printf("\n[*] Caught signal, stopping...\n");
+    fuzzer_stop(g_fuzzer);
+  }
+}
+
+static void print_usage(const char *prog) {
+  printf("FuzzPro v%s - ARM64 macOS Binary Fuzzer\n\n", FUZZPRO_VERSION);
+  printf("Usage: %s [options] <target_binary>\n\n", prog);
+  printf("Options:\n");
+  printf("  -i, --iterations <n>    Number of iterations (0 = infinite)\n");
+  printf("  -t, --timeout <ms>      Execution timeout in milliseconds\n");
+  printf("  -d, --depth <1-10>      Mutation depth/intensity\n");
+  printf("  -c, --corpus <dir>      Input corpus directory\n");
+  printf("  -o, --output <dir>      Crash output directory\n");
+  printf("  -D, --dict <file>       Dictionary file for mutations\n");
+  printf("  -C, --coverage          Enable coverage-guided mode\n");
+  printf("  -L, --cmplog            Enable compare logging\n");
+  printf("  -v, --verbose           Verbose output\n");
+  printf("  -h, --help              Show this help\n");
+  printf("\nUtility modes:\n");
+  printf("  --parse <binary>        Parse and display Mach-O info\n");
+  printf("  --disasm <binary>       Disassemble entry point\n");
+  printf("  --exploit <binary>      Static analysis exploit generation\n");
+  printf("\nExamples:\n");
+  printf("  %s -i 1000 -C ./target\n", prog);
+  printf("  %s -c corpus/ -o crashes/ -t 1000 ./target\n", prog);
+}
+
+static void cmd_parse_macho(const char *path) {
+  MachOInfo *info = macho_parse(path);
+  if (!info) {
+    fprintf(stderr, "Failed to parse: %s\n", path);
+    return;
+  }
+  macho_print_info(info);
+  macho_free(info);
+}
+
+static void cmd_disasm_entry(const char *path) {
+  MachOInfo *info = macho_parse(path);
+  if (!info) {
+    fprintf(stderr, "Failed to parse: %s\n", path);
+    return;
+  }
+
+  printf("[*] Disassembling entry point: 0x%llx\n\n",
+         (unsigned long long)info->entry_point);
+
+  int64_t offset = macho_va_to_offset(info, info->entry_point);
+  if (offset < 0) {
+    fprintf(stderr, "Could not find entry point in file\n");
+    macho_free(info);
+    return;
+  }
+
+  uint8_t code[128];
+  if (macho_read_bytes(info, offset, code, sizeof(code)) < 0) {
+    fprintf(stderr, "Could not read code\n");
+    macho_free(info);
+    return;
+  }
+
+  A64Instruction insns[32];
+  int count =
+      a64_disasm_buffer(code, sizeof(code), info->entry_point, insns, 32);
+
+  for (int i = 0; i < count; i++) {
+    char line[128];
+    a64_format(&insns[i], line, sizeof(line));
+    printf("%s\n", line);
+    if (insns[i].is_return)
+      break;
+  }
+
+  macho_free(info);
+}
 
 int main(int argc, char *argv[]) {
-    const char *target = NULL;
-    int iterations = 1000; // Default
-    int use_coverage_guided = 0; // Default to classic fuzzing
-    int mutation_intensity = 7; // Default mutation intensity (1-10)
-    
-    // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [-i iterations] [-c] [-m intensity] <target_binary>\n", argv[0]);
-            printf("  -i, --iterations: Number of fuzzing iterations (default: 1000)\n");
-            printf("  -c, --coverage: Enable coverage-guided fuzzing (requires ptrace)\n");
-            printf("  -m, --mutation: Set mutation intensity (1-10, default: 7)\n");
-            printf("  -h, --help: Show this help message\n");
-            printf("\nExamples:\n");
-            printf("  %s vulnerable_test                    # Classic fuzzing\n", argv[0]);
-            printf("  %s -c vulnerable_test                 # Coverage-guided fuzzing\n", argv[0]);
-            printf("  %s -i 50 vulnerable_test              # Classic with 50 iterations\n", argv[0]);
-            printf("  %s -c -i 100 vulnerable_test          # Coverage-guided with 100 iterations\n", argv[0]);
-            printf("  %s -m 10 vulnerable_test              # Maximum mutation intensity\n", argv[0]);
-            return 0;
-        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--iterations") == 0) {
-            if (i + 1 < argc) {
-                iterations = atoi(argv[i + 1]);
-                if (iterations <= 0) {
-                    printf("Error: Invalid iteration count: %s\n", argv[i + 1]);
-                    return 1;
-                }
-                i++; // Skip next argument
-            } else {
-                printf("Error: Missing iteration count after %s\n", argv[i]);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--coverage") == 0) {
-            use_coverage_guided = 1;
-        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mutation") == 0) {
-            if (i + 1 < argc) {
-                mutation_intensity = atoi(argv[i + 1]);
-                if (mutation_intensity < 1 || mutation_intensity > 10) {
-                    printf("Error: Mutation intensity must be between 1-10, got: %s\n", argv[i + 1]);
-                    return 1;
-                }
-                i++; // Skip next argument
-            } else {
-                printf("Error: Missing mutation intensity value after %s\n", argv[i]);
-                return 1;
-            }
-        } else if (argv[i][0] != '-') {
-            // This is the target binary
-            if (target == NULL) {
-                target = argv[i];
-            } else {
-                printf("Error: Multiple target binaries specified\n");
-                return 1;
-            }
-        } else {
-            printf("Error: Unknown option: %s\n", argv[i]);
-            printf("Use -h or --help for usage information\n");
-            return 1;
+  FuzzConfig config = {0};
+  config.iterations = 0;
+  config.timeout_ms = 1000;
+  config.mutation_depth = 5;
+  config.strategy = FUZZ_STRATEGY_RANDOM;
+  config.crash_dir = "crashes";
+  config.use_cmplog = 0;
+
+  static struct option long_options[] = {
+      {"iterations", required_argument, 0, 'i'},
+      {"timeout", required_argument, 0, 't'},
+      {"depth", required_argument, 0, 'd'},
+      {"corpus", required_argument, 0, 'c'},
+      {"output", required_argument, 0, 'o'},
+      {"dict", required_argument, 0, 'D'},
+      {"coverage", no_argument, 0, 'C'},
+      {"cmplog", no_argument, 0, 'L'},
+      {"verbose", no_argument, 0, 'v'},
+      {"help", no_argument, 0, 'h'},
+      {"parse", required_argument, 0, 'P'},
+      {"disasm", required_argument, 0, 'A'},
+      {"exploit", required_argument, 0, 'E'},
+      {0, 0, 0, 0}};
+
+  int opt;
+  while ((opt = getopt_long(argc, argv, "i:t:d:c:o:D:CLvh", long_options,
+                            NULL)) != -1) {
+    switch (opt) {
+    case 'i':
+      config.iterations = atoi(optarg);
+      break;
+    case 't':
+      config.timeout_ms = atoi(optarg);
+      break;
+    case 'd':
+      config.mutation_depth = atoi(optarg);
+      if (config.mutation_depth < 1)
+        config.mutation_depth = 1;
+      if (config.mutation_depth > 10)
+        config.mutation_depth = 10;
+      break;
+    case 'c':
+      config.corpus_dir = optarg;
+      break;
+    case 'o':
+      config.crash_dir = optarg;
+      break;
+    case 'D':
+      config.dict_path = optarg;
+      break;
+    case 'C':
+      config.strategy = FUZZ_STRATEGY_COVERAGE;
+      break;
+    case 'L':
+      config.use_cmplog = 1;
+      break;
+    case 'v':
+      break;
+    case 'P':
+      cmd_parse_macho(optarg);
+      return 0;
+    case 'A':
+      cmd_disasm_entry(optarg);
+      return 0;
+    case 'E': {
+      ExploitGen *eg = exploitgen_create(optarg);
+      if (eg) {
+        exploitgen_analyze(eg);
+        ExploitPlan *plan = exploitgen_plan(eg);
+        if (plan) {
+          exploitgen_generate_payload(eg, plan);
+          exploitgen_test_payload(eg, optarg);
+          free(plan);
         }
+        exploitgen_destroy(eg);
+      }
+      return 0;
     }
-    
-    if (target == NULL) {
-        printf("Error: No target binary specified\n");
-        printf("Usage: %s [-i iterations] <target_binary>\n", argv[0]);
-        printf("Use -h or --help for more information\n");
-        return 1;
+    case 'h':
+    default:
+      print_usage(argv[0]);
+      return opt == 'h' ? 0 : 1;
     }
+  }
 
-    BinaryFormat fmt = detect_format(target);
-    printf("[*] Target: %s\n", target);
-    printf("[*] Format: %s\n", format_to_str(fmt));
-    printf("[*] Iterations: %d\n", iterations);
-    printf("[*] Mode: %s\n", use_coverage_guided ? "Coverage-guided (ptrace)" : "Classic fuzzing");
-    printf("[*] Mutation Intensity: %d/10\n", mutation_intensity);
-    printf("[*] Initializing fuzzing engine...\n");
+  if (optind >= argc) {
+    fprintf(stderr, "Error: No target binary specified\n\n");
+    print_usage(argv[0]);
+    return 1;
+  }
 
-    // Set target binary path for crash analysis
-    target_binary_path = (char*)target;
+  config.target_path = argv[optind];
 
-    // Set target format for platform-specific signal handling
-    set_target_format(fmt);
+  signal(SIGINT, signal_handler);
+  signal(SIGTERM, signal_handler);
 
-    // Initialize advanced fuzzing engine with professional settings
-    FuzzingConfig config = {
-        .strategy = STRATEGY_HYBRID,
-        .mutation_intensity = mutation_intensity,  // Use user-specified intensity
-        .payload_focus = 1,
-        .structure_awareness = 1,
-        .dictionary_usage = 1
-    };
-    init_advanced_fuzzing(&config);
+  Fuzzer *fuzzer = fuzzer_create(&config);
+  if (!fuzzer) {
+    fprintf(stderr, "Failed to initialize fuzzer\n");
+    return 1;
+  }
 
-    srand(time(NULL));
-    
-    // Choose fuzzing mode based on user preference
-    if (use_coverage_guided) {
-        printf("[*] Starting coverage-guided fuzzing with dynamic instrumentation...\n");
-        fuzz_target_with_coverage_guidance(target, iterations);
-    } else {
-        printf("[*] Starting classic fuzzing...\n");
-        fuzz_target_with_progress(target, iterations);
-    }
+  g_fuzzer = fuzzer;
+  int result = fuzzer_run(fuzzer);
+  fuzzer_destroy(fuzzer);
 
-    return 0;
+  return result;
 }
