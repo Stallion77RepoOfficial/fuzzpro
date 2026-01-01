@@ -42,28 +42,8 @@ $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo ""
 	@echo "Build complete: $(TARGET)"
-	@echo "Run './fuzzpro --help' for usage"
-
-debug: CFLAGS += -fsanitize=address -fsanitize=undefined
-debug: LDFLAGS += -fsanitize=address -fsanitize=undefined
-debug: $(TARGET)
-
-release: CFLAGS = -Wall -O3 -Iinclude -arch arm64 -DNDEBUG
-release: $(TARGET)
-	strip $(TARGET)
-
-test: $(TARGET)
-	@echo "Testing Mach-O parser..."
-	./$(TARGET) --parse /bin/ls
-	@echo ""
-	@echo "Testing disassembler..."
-	./$(TARGET) --disasm /bin/ls | head -20
 
 clean:
 	rm -f $(TARGET)
-	rm -rf crashes/
 
-install: release
-	install -m 755 $(TARGET) /usr/local/bin/
-
-.PHONY: all debug release test clean install
+.PHONY: all clean
